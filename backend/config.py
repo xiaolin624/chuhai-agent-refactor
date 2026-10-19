@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     REPORT_ESCALATED_MAX_TOKENS: int = 8000
     MAX_AGENT_STEPS: int = 16
 
+    # ── 编排器 ──
+    # handwritten（默认）| langgraph
+    # langgraph 走 app/agent/graph_lg.py 的事件路由图；未安装 langgraph 时自动降级为手写。
+    AGENT_ORCHESTRATOR: str = "handwritten"
+
 
 @lru_cache
 def get_settings() -> Settings:

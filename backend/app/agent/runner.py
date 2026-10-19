@@ -134,23 +134,51 @@ async def run_agent_event(
             terminal=TerminalState.MAX_STEPS_EXCEEDED,
         )
 
-    if event.type == "user_message":
+    async def _get_registry() -> ToolRegistry:
+        nonlocal registry
+        if registry is None:
+            registry = await _build_tool_registry(db_session)
+        return registry
+
+    async def _dispatch_user_message() -> AgentRunResult:
         return await _handle_user_message(
-            state, event, registry or await _build_tool_registry(db_session),
+            state, event, await _get_registry(),
             provider_base_url=provider_base_url,
             provider_api_key=provider_api_key,
             provider_model=provider_model,
             db_session=db_session,
         )
 
-    if event.type == "finish_requested":
+    async def _dispatch_finish() -> AgentRunResult:
         return await _handle_finish_requested(
-            state, registry or await _build_tool_registry(db_session),
+            state, await _get_registry(),
             provider_base_url=provider_base_url,
             provider_api_key=provider_api_key,
             provider_model=provider_model,
             db_session=db_session,
         )
+
+    # 编排器：默认手写分发；设为 langgraph 时走事件图（图内节点仍调用上面两个处理器，
+    # 行为不变，只把"事件类型 → 处理器"变成可视化路由）。langgraph 缺失时自动降级。
+    if get_settings().AGENT_ORCHESTRATOR == "langgraph":
+        from app.agent.graph_lg import LANGGRAPH_AVAILABLE, run_event_via_graph
+
+        if LANGGRAPH_AVAILABLE:
+            result = await run_event_via_graph(
+                event.type, _dispatch_user_message, _dispatch_finish
+            )
+            if result is not None:
+                return result
+            return AgentRunResult(state=state, terminal=TerminalState.FAILED)
+        logger.warning(
+            "AGENT_ORCHESTRATOR=langgraph 但 langgraph 未安装，退回手写分发"
+        )
+
+    if event.type == "user_message":
+        return await _dispatch_user_message()
+
+    if event.type == "finish_requested":
+        return await _dispatch_finish()
 
     return AgentRunResult(state=state, terminal=TerminalState.FAILED)
 
@@ -360,8 +388,21 @@ async def _handle_finish_requested(
         logger.warning("rag.search failed: %s %s", rag_result.error.code, rag_result.error.message)
     rag_context = rag_result.data.matches if rag_result.error is None else []
 
+    # 召回兜底落地：两轮后仍低 → 拒答。此时**不把低分片段交给报告生成**，
+    # 并在 state 上留痕，供报告环节与审计判断"知识库未命中"。
+    if rag_result.error is None and rag_result.data is not None and rag_result.data.refused:
+        rag_context = []
+        current = current.model_copy(deep=True)
+        current.validation_errors.append(
+            f"knowledge_insufficient: {rag_result.data.reason}"
+        )
+        logger.warning(
+            "rag.search refused (best=%.3f, rounds=%d, rewrites=%s)",
+            rag_result.data.best_score, rag_result.data.rounds, rag_result.data.rewrites,
+        )
+
     # 保存安全 RAG 引用到 state（供报告详情展示）
-    if rag_result.error is None and rag_result.data is not None:
+    if rag_result.error is None and rag_result.data is not None and not rag_result.data.refused:
         from app.schemas.rag import RagMatchSafe
         safe_matches = [
             RagMatchSafe.from_match(m).model_dump() for m in (rag_result.data.matches or [])
