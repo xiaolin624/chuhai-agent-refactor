@@ -58,3 +58,6 @@ M4_PROMPT.md
 env-vars.json
 cloudfunctions/node_modules
 reference/SonettoHere/
+
+# 本地测试用虚拟环境
+.venv-test/
